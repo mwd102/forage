@@ -9,6 +9,11 @@ services:
     volumes:
       - ./config.yaml:/etc/forage/config.yaml:ro   # bind mount, read-only
     env_file: .env
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    shm_size: 1gb
     networks:
       - searxng_default          # talk to SearXNG by service name (searxng:8080)
     healthcheck:

@@ -16,7 +16,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from . import __version__
-from .auth import extract_bearer, key_is_valid, load_api_keys
+from .auth import key_is_valid, load_api_keys
 from .browser import BrowserPool
 from .cache import TTLCache
 from .config import load_config
@@ -34,6 +34,15 @@ logger = logging.getLogger("forage")
 search_cache = TTLCache(max_entries=config.cache.max_entries)
 extract_cache = TTLCache(max_entries=config.cache.max_entries)
 browser_pool = BrowserPool(config.browser, user_agent=config.extract.browser_user_agent)
+proxy_browser_pool = (
+    BrowserPool(
+        config.browser,
+        user_agent=config.extract.browser_user_agent,
+        proxy=config.proxy,
+    )
+    if config.proxy.enabled
+    else None
+)
 
 api_keys = load_api_keys()
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -55,8 +64,14 @@ def require_auth(
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await browser_pool.start()
-    yield
-    await browser_pool.stop()
+    if proxy_browser_pool is not None:
+        await proxy_browser_pool.start()
+    try:
+        yield
+    finally:
+        if proxy_browser_pool is not None:
+            await proxy_browser_pool.stop()
+        await browser_pool.stop()
 
 
 app = FastAPI(
@@ -82,6 +97,7 @@ class ExtractRequest(BaseModel):
     wait_for: Optional[str] = Field(default=None, max_length=200)
     timeout: Optional[int] = Field(default=None, ge=1, le=120)
     engine: Optional[str] = Field(default=None, pattern="^(trafilatura|readability)$")
+    proxy_mode: str = Field(default="auto", pattern="^(never|auto|always)$")
 
 
 def _search_cache_key(req: SearchRequest) -> str:
@@ -89,8 +105,18 @@ def _search_cache_key(req: SearchRequest) -> str:
     return f"search:{req.query}|{req.limit}|{req.language or ''}|{engines}"
 
 
-def _extract_cache_key(urls: List[str], force_render: bool, wait_for: Optional[str], fmt: str, engine: Optional[str]) -> str:
-    return f"extract:{','.join(urls)}|{force_render}|{wait_for or ''}|{fmt}|{engine or ''}"
+def _extract_cache_key(
+    urls: List[str],
+    force_render: bool,
+    wait_for: Optional[str],
+    fmt: str,
+    engine: Optional[str],
+    proxy_mode: str,
+) -> str:
+    return (
+        f"extract:{','.join(urls)}|{force_render}|{wait_for or ''}|"
+        f"{fmt}|{engine or ''}|{proxy_mode}"
+    )
 
 
 @app.get("/health")
@@ -102,6 +128,10 @@ async def health() -> dict:
         "version": __version__,
         "config_source": config.source_path,
         "browser_engine": config.browser.engine,
+        "proxy": {
+            "enabled": config.proxy.enabled,
+            "mode": config.proxy.mode,
+        },
         "cache": {
             "enabled": config.cache.enabled,
             "max_entries": config.cache.max_entries,
@@ -167,7 +197,14 @@ async def extract(
         elif "raw_html" in req.formats:
             fmt = "html"
 
-    key = _extract_cache_key(req.urls, req.force_render, req.wait_for, fmt, req.engine)
+    key = _extract_cache_key(
+        req.urls,
+        req.force_render,
+        req.wait_for,
+        fmt,
+        req.engine,
+        req.proxy_mode,
+    )
     if cache_enabled:
         cached = extract_cache.get(key)
         if cached is not None:
@@ -179,6 +216,8 @@ async def extract(
                 config,
                 browser_pool,
                 url,
+                proxy_pool=proxy_browser_pool,
+                proxy_mode=req.proxy_mode,
                 force_render=req.force_render,
                 wait_for=req.wait_for,
                 output_format=fmt,

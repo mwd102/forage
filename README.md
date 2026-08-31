@@ -30,7 +30,9 @@ It was developed as the extract/search backend for Hermes Agent and ships with a
 - **Three browser engines** (`browser.engine`): `playwright` (default), `patchright` (anti-detection fork) and `scrapling` (fingerprint impersonation + Cloudflare Turnstile bypass)
 - **Two extract engines** (`extract.engine`, per-domain or per request): `trafilatura` (default, main-content markdown) and `readability` (Mozilla Readability.js in the browser + markdownify, keeps buyboxes/comments that trafilatura drops as non-main). Amazon product pages use `readability` by default
 - **Anti-bot fallback** (`browser.fallback_solver`): if any engine hits a challenge, Forage retries the page with the Scrapling built-in solver as a last resort
+- **Optional proxy escalation**: keep normal traffic direct, then retry browser failures and persistent challenges through a separately configured proxy pool
 - **Structured markdown output**: extraction is returned as real markdown (headings, bold, lists, code blocks) via trafilatura's markdown format or the Readability.js + markdownify engine
+- **Public-web guardrails**: reject non-public destinations and bound response/document downloads before extraction
 - **Basic stealth**: hides automation signals from Cloudflare-class protections (configurable, on by default)
 - **In-memory TTL cache** with a master switch and per-operation toggles (search 5 min, extract off by default)
 - **Optional Bearer API-key auth** (constant-time comparison, keys via env)
@@ -150,7 +152,8 @@ Response header `X-Forage-Cache: hit|miss|bypass|disabled`.
   "force_render": false,
   "wait_for": null,
   "only_main_content": true,
-  "timeout": 30
+  "timeout": 30,
+  "proxy_mode": "auto"
 }
 ```
 
@@ -162,19 +165,24 @@ Response (per URL):
   "data": [
     {
       "url": "https://...",
+      "final_url": "https://...",
       "title": "...",
       "content": "clean markdown text...",
       "raw_content": "clean markdown (or raw HTML; see raw_content_markdown)",
-      "method": "static"        // "static" | "browser" | "browser+solver" | "pdf" | "docx" | ...
+      "method": "static",
+      "egress": "direct",
+      "status_code": 200,
+      "content_type": "text/html",
+      "retrieved_at": "2026-01-01T12:00:00+00:00",
+      "truncated": false
     }
   ]
 }
 ```
 
-`method` tells you how the page was fetched: `static` (HTTP), `browser`
-(configured engine), `browser+solver` (engine hit an anti-bot challenge and the
-Scrapling solver retry succeeded), or a document type (`pdf`, `docx`, `xlsx`,
-`pptx`, `rtf`).
+`method` tells you how the page was fetched. Proxy retries use
+`browser+proxy` or `browser+proxy+solver`. `egress` reports `direct` or
+`proxy`, allowing callers to audit escalation without exposing credentials.
 
 If a page is behind an anti-bot challenge (Cloudflare etc.), Forage returns a clear error instead of challenge-page garbage:
 
@@ -196,16 +204,21 @@ cache:    { enabled, max_entries, search: {enabled, ttl}, extract: {enabled, ttl
 search:   { searxng_url, default_lang, engines, timeout }
 extract:  { timeout, max_content_chars, only_main_content, user_agent,
             browser_user_agent, respect_robots, force_render, wait_for,
-            min_content_chars, raw_content_markdown, domain_overrides }
+            min_content_chars, raw_content_markdown, allow_private_networks,
+            max_download_bytes, domain_overrides }
 browser:  { engine, min_idle, max_instances, idle_timeout, headless, launch_timeout,
             stealth, network_idle_timeout, scroll_steps, challenge_timeout,
             solve_cloudflare, fallback_solver }
+proxy:    { enabled, mode }
 auth:     { enabled }
 ```
 
 | Environment variable | Where | Purpose |
 |---|---|---|
 | `FORAGE_API_KEYS` | service `.env` | Comma-separated Bearer keys (auth.enabled) |
+| `FORAGE_PROXY_SERVER` | service `.env` | Optional HTTP(S) proxy endpoint |
+| `FORAGE_PROXY_USERNAME` | service `.env` | Optional proxy username |
+| `FORAGE_PROXY_PASSWORD` | service `.env` | Optional proxy password |
 | `FORAGE_CONFIG` | service `.env` | Config path inside container (default `/etc/forage/config.yaml`) |
 | `TZ` | service `.env` | Container timezone |
 | `FORAGE_URL` | Hermes `.env` | Base URL the plugin calls |
@@ -227,7 +240,9 @@ Browser results also run through the challenge detector, so blocked pages
 report an error rather than junk content. When a challenge is detected and
 `browser.fallback_solver` is enabled (default), Forage retries the page with
 the Scrapling built-in solver as a last resort; the final `method` is
-`browser+solver` when that retry succeeds.
+`browser+solver` when that retry succeeds. With proxy fallback enabled, a
+failed browser or persistent challenge receives one final retry through the
+configured proxy pool.
 
 ## Benchmark
 
@@ -249,7 +264,16 @@ scrapes.
 ## Development
 
 ```bash
-# Run tests / smoke checks against a running instance (see docs for details)
+# Install the locked runtime and development tools, then run checks.
+python -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/ruff check app tests
+.venv/bin/pytest -q
+
+# Regenerate the runtime lock after intentionally changing requirements.txt.
+.venv/bin/pip-compile --strip-extras --output-file requirements.lock requirements.txt
+
+# Smoke check against a running instance.
 curl -s -X POST http://localhost:3672/search -H 'Content-Type: application/json' -d '{"query":"test","limit":3}'
 ```
 

@@ -52,6 +52,8 @@ DEFAULTS: Dict[str, Any] = {
         "min_content_chars": 200,
         "raw_content_markdown": True,
         "prefer_markdown": True,   # negotiate Accept: text/markdown; use native markdown when the server serves it
+        "allow_private_networks": False,
+        "max_download_bytes": 25_000_000,
         "domain_overrides": {},
     },
     "browser": {
@@ -68,6 +70,10 @@ DEFAULTS: Dict[str, Any] = {
         "challenge_timeout": 15,
         "solve_cloudflare": False,
         "fallback_solver": True,
+    },
+    "proxy": {
+        "enabled": False,
+        "mode": "fallback",
     },
     "auth": {"enabled": False},
 }
@@ -151,6 +157,8 @@ class ExtractConfig:
     min_content_chars: int = 200
     raw_content_markdown: bool = True
     prefer_markdown: bool = True
+    allow_private_networks: bool = False
+    max_download_bytes: int = 25_000_000
     domain_overrides: tuple = ()
 
 
@@ -172,6 +180,15 @@ class BrowserConfig:
 
 
 @dataclass(frozen=True)
+class ProxyConfig:
+    enabled: bool = False
+    mode: str = "fallback"  # "fallback" or "always"
+    server: str = ""
+    username: str = ""
+    password: str = ""
+
+
+@dataclass(frozen=True)
 class AuthConfig:
     enabled: bool = False
 
@@ -183,6 +200,7 @@ class ForageConfig:
     search: SearchConfig
     extract: ExtractConfig
     browser: BrowserConfig
+    proxy: ProxyConfig
     auth: AuthConfig
     source_path: str
 
@@ -193,6 +211,7 @@ class ForageConfig:
         search = data.get("search", {})
         extract = data.get("extract", {})
         browser = data.get("browser", {})
+        proxy = data.get("proxy", {})
         auth = data.get("auth", {})
         return cls(
             server=ServerConfig(**server),
@@ -218,6 +237,13 @@ class ForageConfig:
                 }
             ),
             browser=BrowserConfig(**browser),
+            proxy=ProxyConfig(
+                enabled=proxy.get("enabled", False),
+                mode=proxy.get("mode", "fallback"),
+                server=os.environ.get("FORAGE_PROXY_SERVER", ""),
+                username=os.environ.get("FORAGE_PROXY_USERNAME", ""),
+                password=os.environ.get("FORAGE_PROXY_PASSWORD", ""),
+            ),
             auth=AuthConfig(**auth),
             source_path=source_path,
         )
@@ -249,6 +275,16 @@ class ForageConfig:
             raise ValueError(
                 f"extract.engine inválido: {self.extract.engine} (use trafilatura ou readability)"
             )
+        if self.extract.max_download_bytes < 1:
+            raise ValueError("extract.max_download_bytes must be >= 1")
+        if self.proxy.mode not in ("fallback", "always"):
+            raise ValueError("proxy.mode must be fallback or always")
+        if self.proxy.enabled and not self.proxy.server:
+            raise ValueError(
+                "proxy.enabled requires FORAGE_PROXY_SERVER in the environment"
+            )
+        if self.proxy.enabled and self.browser.engine == "obscura":
+            raise ValueError("proxy is not supported with browser.engine=obscura")
         if self.browser.min_idle > self.browser.max_instances and self.browser.max_instances > 0:
             raise ValueError("browser.min_idle não pode exceder browser.max_instances")
         for override in self.extract.domain_overrides:

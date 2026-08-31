@@ -3,8 +3,8 @@ FROM python:3.12-slim
 WORKDIR /srv/forage
 
 # Dependencies first (layer caching). Playwright downloads Chromium + system deps.
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
+COPY requirements.txt requirements.lock ./
+RUN pip install --no-cache-dir -r requirements.lock \
     && playwright install --with-deps chromium \
     && patchright install chromium \
     && scrapling install

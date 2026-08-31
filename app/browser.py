@@ -99,7 +99,12 @@ class BrowserPool:
         max_instances (the CDP server owns the actual browser processes).
     """
 
-    def __init__(self, browser_config: Any, user_agent: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        browser_config: Any,
+        user_agent: Optional[str] = None,
+        proxy: Optional[Any] = None,
+    ) -> None:
         self.engine = browser_config.engine
         self.cdp_url = getattr(browser_config, "cdp_url", "")  # engine=obscura
         self.min_idle = browser_config.min_idle
@@ -116,6 +121,7 @@ class BrowserPool:
         # Explicit browser UA wins; otherwise fall back to a real Chrome UA
         # (a bot UA would be a giveaway against anti-bot systems).
         self.user_agent = user_agent or DEFAULT_BROWSER_UA
+        self.proxy = proxy
         self._idle: Deque[tuple[float, Any]] = deque()  # (last_used, browser)
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._pw: Optional[Any] = None
@@ -141,7 +147,7 @@ class BrowserPool:
             # configurable: the built-in solver costs ~5s per page (it waits
             # for networkidle before detecting), while our page_action polls
             # the title and resolves non-interactive challenges for free.
-            self._scrapling_session = AsyncStealthySession(
+            session_options = dict(
                 headless=self.headless,
                 network_idle=False,
                 timeout=self.launch_timeout * 1000,
@@ -149,6 +155,9 @@ class BrowserPool:
                 solve_cloudflare=self.solve_cloudflare,
                 useragent=self.user_agent,
             )
+            if self.proxy is not None:
+                session_options["proxy"] = self._scrapling_proxy()
+            self._scrapling_session = AsyncStealthySession(**session_options)
             await self._scrapling_session.start()
             self._semaphore = asyncio.Semaphore(self.max_instances)
             self._started = True
@@ -226,10 +235,15 @@ class BrowserPool:
             launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
             if self.stealth:
                 launch_args.append("--disable-blink-features=AutomationControlled")
+            launch_options: Dict[str, Any] = {
+                "headless": self.headless,
+                "timeout": self.launch_timeout * 1000,
+                "args": launch_args,
+            }
+            if self.proxy is not None:
+                launch_options["proxy"] = self._playwright_proxy()
             browser = await self._pw.chromium.launch(
-                headless=self.headless,
-                timeout=self.launch_timeout * 1000,
-                args=launch_args,
+                **launch_options,
             )
             return browser
         except Exception as exc:  # noqa: BLE001
@@ -413,7 +427,7 @@ class BrowserPool:
                 self._scrapling_session = None
             from scrapling.fetchers import AsyncStealthySession
 
-            self._scrapling_session = AsyncStealthySession(
+            session_options = dict(
                 headless=self.headless,
                 network_idle=False,
                 timeout=self.launch_timeout * 1000,
@@ -421,6 +435,9 @@ class BrowserPool:
                 solve_cloudflare=self.solve_cloudflare,
                 useragent=self.user_agent,
             )
+            if self.proxy is not None:
+                session_options["proxy"] = self._scrapling_proxy()
+            self._scrapling_session = AsyncStealthySession(**session_options)
             await self._scrapling_session.start()
             logger.warning("Scrapling session recreated after browser death")
 
@@ -517,7 +534,7 @@ class BrowserPool:
             if self._solver_session is None:
                 from scrapling.fetchers import AsyncStealthySession
 
-                self._solver_session = AsyncStealthySession(
+                session_options = dict(
                     headless=self.headless,
                     network_idle=False,
                     timeout=self.launch_timeout * 1000,
@@ -525,9 +542,24 @@ class BrowserPool:
                     solve_cloudflare=True,
                     useragent=self.user_agent,
                 )
+                if self.proxy is not None:
+                    session_options["proxy"] = self._scrapling_proxy()
+                self._solver_session = AsyncStealthySession(**session_options)
                 await self._solver_session.start()
                 logger.info("Scrapling solver session ready (last-resort anti-bot retry)")
         return self._solver_session
+
+    def _playwright_proxy(self) -> Dict[str, str]:
+        result = {"server": self.proxy.server}
+        if self.proxy.username:
+            result["username"] = self.proxy.username
+        if self.proxy.password:
+            result["password"] = self.proxy.password
+        return result
+
+    def _scrapling_proxy(self) -> Union[str, Dict[str, str]]:
+        proxy = self._playwright_proxy()
+        return proxy if len(proxy) > 1 else proxy["server"]
 
     async def render_with_solver(
         self,

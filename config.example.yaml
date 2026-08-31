@@ -58,6 +58,8 @@ extract:
   prefer_markdown: true   # negotiate Accept: text/markdown; when the server serves native
                           # markdown (e.g. via .htaccess / Vary: Accept), use it directly
                           # instead of converting HTML with trafilatura (method: "markdown")
+  allow_private_networks: false # reject loopback, private, link-local and metadata destinations
+  max_download_bytes: 25000000 # hard response/document download limit before extraction
   # domain_overrides: per-pattern extraction overrides. The YAML key is a
   # pattern (www-insensitive, case-insensitive):
   #   "x.com"            -> host or any subdomain
@@ -203,6 +205,13 @@ browser:
   fallback_solver: true    # on any anti-bot failure (any engine), retry the page with the
                            # scrapling built-in solver as a last resort. Costs ~5s/page only
                            # when a challenge is detected; turns failures into successes
+
+# --- Optional outbound proxy --------------------------------
+# Credentials are read from FORAGE_PROXY_SERVER,
+# FORAGE_PROXY_USERNAME and FORAGE_PROXY_PASSWORD.
+proxy:
+  enabled: false
+  mode: fallback          # fallback: direct first, proxy on failure; always: browser through proxy
 
 # --- Auth (optional) ------------------------------------------
 # API keys come from env: FORAGE_API_KEYS (comma separated)
