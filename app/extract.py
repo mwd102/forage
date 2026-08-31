@@ -15,8 +15,9 @@ import asyncio
 import fnmatch
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
-from urllib.parse import urlparse
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Tuple, Union
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import trafilatura
@@ -25,6 +26,7 @@ from markdownify import markdownify as _markdownify
 from .browser import BrowserPool
 from .config import ForageConfig
 from .documents import extract_document_bytes, looks_like_document
+from .url_safety import UnsafeUrlError, validate_public_url
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,32 @@ logger = logging.getLogger(__name__)
 RETRY_STATUS = {429, 500, 502, 503, 504}
 RETRY_DELAY = 0.5
 RETRY_ATTEMPTS = 2  # total attempts: 1 initial + 1 retry
+REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+MAX_REDIRECTS = 10
+
+
+async def _safe_get(
+    client: httpx.AsyncClient,
+    config: ForageConfig,
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+) -> httpx.Response:
+    """GET a URL while validating every redirect before following it."""
+    current = url
+    for _ in range(MAX_REDIRECTS + 1):
+        await validate_public_url(
+            current,
+            allow_private=config.extract.allow_private_networks,
+        )
+        response = await client.get(current, headers=headers)
+        if response.status_code not in REDIRECT_STATUSES:
+            return response
+        location = response.headers.get("location")
+        if not location:
+            return response
+        current = urljoin(str(response.url), location)
+    raise httpx.TooManyRedirects("Too many redirects", request=response.request)
 
 SPA_MARKERS = [
     'id="root"',
@@ -324,14 +352,20 @@ async def _extract_document(
         "Accept": "*/*",
     }
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-            resp = await client.get(url, headers=headers)
-    except httpx.RequestError as exc:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=timeout) as client:
+            resp = await _safe_get(client, config, url, headers=headers)
+    except (httpx.RequestError, UnsafeUrlError) as exc:
         logger.warning("Document download failed for %s: %s", url, exc)
         return None
     if resp.status_code != 200:
         logger.info("%s -> HTTP %d, falling back to hybrid", url, resp.status_code)
         return None
+    if len(resp.content) > config.extract.max_download_bytes:
+        logger.warning("Document exceeds download limit for %s", url)
+        return {
+            "url": url,
+            "error": "Document exceeds configured download limit",
+        }
     content_type = resp.headers.get("content-type", "")
     if not looks_like_document(url, content_type):
         return None
@@ -351,10 +385,16 @@ async def _extract_document(
         raw_content = ""
     return {
         "url": url,
+        "final_url": str(resp.url),
         "title": title,
         "content": text,
         "raw_content": raw_content,
         "method": method_label,
+        "egress": "direct",
+        "status_code": resp.status_code,
+        "content_type": content_type.split(";", 1)[0].strip().lower(),
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "truncated": len(text) >= config.extract.max_content_chars,
     }
 
 
@@ -380,13 +420,13 @@ async def fetch_static(
         "User-Agent": config.extract.user_agent,
         "Accept": accept,
     }
-    async with httpx.AsyncClient(follow_redirects=True, timeout=config.extract.timeout) as client:
+    async with httpx.AsyncClient(follow_redirects=False, timeout=config.extract.timeout) as client:
         robots_error = await _check_robots(client, config, url)
         if robots_error:
             return None, 0, url, ""  # caller treats 0 as blocked-by-robots
         for attempt in range(RETRY_ATTEMPTS):
             try:
-                resp = await client.get(url, headers=headers)
+                resp = await _safe_get(client, config, url, headers=headers)
                 if resp.status_code in RETRY_STATUS and attempt < RETRY_ATTEMPTS - 1:
                     logger.info(
                         "%s -> HTTP %d (transient), retrying in %.1fs",
@@ -395,8 +435,11 @@ async def fetch_static(
                     await asyncio.sleep(RETRY_DELAY)
                     continue
                 content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+                if len(resp.content) > config.extract.max_download_bytes:
+                    logger.warning("Response exceeds download limit for %s", url)
+                    return None, 413, str(resp.url), content_type
                 return resp.text, resp.status_code, str(resp.url), content_type
-            except httpx.RequestError as exc:
+            except (httpx.RequestError, UnsafeUrlError) as exc:
                 if attempt < RETRY_ATTEMPTS - 1:
                     logger.info("%s -> request error, retrying in %.1fs: %s", url, RETRY_DELAY, exc)
                     await asyncio.sleep(RETRY_DELAY)
@@ -470,6 +513,8 @@ async def extract_url(
     pool: BrowserPool,
     url: str,
     *,
+    proxy_pool: Optional[BrowserPool] = None,
+    proxy_mode: str = "auto",
     force_render: bool = False,
     wait_for: Optional[str] = None,
     output_format: str = "markdown",
@@ -489,6 +534,14 @@ async def extract_url(
     method = "static"
 
     original_url = url
+
+    try:
+        await validate_public_url(
+            original_url,
+            allow_private=config.extract.allow_private_networks,
+        )
+    except UnsafeUrlError as exc:
+        return {"url": original_url, "error": str(exc)}
 
     # Resolve the domain override on the ORIGINAL URL (before any rewrite).
     override = _find_override(url, config.extract.domain_overrides)
@@ -526,11 +579,26 @@ async def extract_url(
     if rewritten != url:
         logger.info("%s -> URL rewritten to %s", url, rewritten)
         url = rewritten
+        try:
+            await validate_public_url(
+                url,
+                allow_private=config.extract.allow_private_networks,
+            )
+        except UnsafeUrlError as exc:
+            return {"url": original_url, "error": str(exc)}
+
+    use_proxy_first = proxy_mode == "always" or (
+        proxy_mode == "auto" and config.proxy.mode == "always"
+    )
+    if use_proxy_first and proxy_pool is None:
+        return {"url": original_url, "error": "Proxy mode requested but no proxy is configured"}
+    active_pool = proxy_pool if use_proxy_first and proxy_pool is not None else pool
+    active_egress = "proxy" if active_pool is proxy_pool else "direct"
 
     # Documents (pdf/docx/xlsx/pptx/rtf) are extracted from raw bytes -
     # never through the browser (Chromium renders PDFs poorly). Falls back
     # to the hybrid flow when the URL is not actually a document.
-    if not effective_force_render:
+    if not effective_force_render and not use_proxy_first:
         doc_result = await _extract_document(config, url, effective_timeout)
         if doc_result is not None:
             doc_result["url"] = original_url
@@ -540,7 +608,7 @@ async def extract_url(
     # renders. It must NOT force the browser: pages that extract fine with
     # plain HTTP + trafilatura stay on the static path. The browser is only
     # used when an override/request demands it or the hybrid check needs it.
-    want_browser = effective_force_render or bool(effective_wait_for)
+    want_browser = effective_force_render or bool(effective_wait_for) or use_proxy_first
 
     html: Optional[Union[str, Dict[str, str]]] = None
     status = 0
@@ -548,12 +616,22 @@ async def extract_url(
     native_markdown = False
     readability_title: Optional[str] = None
     readability_rendered = False
+    final_url = url
 
     if not want_browser:
-        html, status, _, content_type = await fetch_static(config, url)
+        html, status, final_url, content_type = await fetch_static(config, url)
+        try:
+            await validate_public_url(
+                final_url,
+                allow_private=config.extract.allow_private_networks,
+            )
+        except UnsafeUrlError as exc:
+            return {"url": original_url, "error": f"Unsafe redirect target: {exc}"}
         if status == 0:
             # network error or robots-blocked; browser rarely helps, fail clean
             return {"url": original_url, "error": "Failed to fetch URL (network error or robots.txt)"}
+        if status == 413:
+            return {"url": original_url, "error": "Response exceeds configured download limit"}
         if status in (401, 403, 429):
             logger.info("%s -> HTTP %d, falling back to browser", url, status)
             want_browser = True
@@ -580,10 +658,16 @@ async def extract_url(
             return {"url": original_url, "error": "No content extracted"}
         result: Dict[str, Any] = {
             "url": original_url,
+            "final_url": final_url,
             "title": "",
             "content": content,
             "raw_content": raw_content,
             "method": "markdown",
+            "egress": "direct",
+            "status_code": status,
+            "content_type": "text/markdown",
+            "retrieved_at": datetime.now(timezone.utc).isoformat(),
+            "truncated": len(md) > config.extract.max_content_chars,
         }
         if url != original_url:
             result["rewritten_url"] = url
@@ -591,7 +675,7 @@ async def extract_url(
 
     if want_browser:
         try:
-            html = await pool.render(
+            html = await active_pool.render(
                 url,
                 wait_for=effective_wait_for,
                 timeout=effective_timeout,
@@ -609,6 +693,30 @@ async def extract_url(
                 readability_title = None
         except Exception as exc:  # noqa: BLE001
             logger.warning("Browser render failed for %s: %s", url, exc)
+            if (
+                proxy_mode == "auto"
+                and proxy_pool is not None
+                and active_pool is not proxy_pool
+            ):
+                logger.info("%s -> direct browser failed, retrying through proxy", url)
+                try:
+                    html = await proxy_pool.render(
+                        url,
+                        wait_for=effective_wait_for,
+                        timeout=effective_timeout,
+                        scroll_steps=_scroll_steps_for(config, effective_scroll),
+                        network_idle_timeout=effective_idle,
+                        challenge_timeout=effective_challenge,
+                        readability=effective_readability,
+                    )
+                    active_egress = "proxy"
+                    method = "browser+proxy"
+                    if effective_readability and isinstance(html, dict):
+                        readability_rendered = True
+                        readability_title = html.get("title") or ""
+                        html = html.get("content") or ""
+                except Exception as proxy_exc:  # noqa: BLE001
+                    logger.warning("Proxy browser retry failed for %s: %s", url, proxy_exc)
             if html is None:
                 return {"url": original_url, "error": f"Browser render failed: {exc}"}
             # static html (if any) is still better than nothing
@@ -625,7 +733,7 @@ async def extract_url(
         if needs_render:
             logger.info("%s -> %s, falling back to browser", url, render_reason)
             try:
-                html = await pool.render(
+                html = await active_pool.render(
                     url,
                     wait_for=effective_wait_for,
                     timeout=effective_timeout,
@@ -662,7 +770,7 @@ async def extract_url(
             # poll cannot. Only pays the ~5s/page solver cost on failure.
             logger.info("%s -> anti-bot challenge, retrying with scrapling solver", url)
             try:
-                solver_html = await pool.render_with_solver(
+                solver_html = await active_pool.render_with_solver(
                     url,
                     wait_for=effective_wait_for,
                     timeout=effective_timeout,
@@ -686,6 +794,37 @@ async def extract_url(
                 )
                 if not content:
                     return {"url": original_url, "error": "No content extracted"}
+            if (
+                looks_like_challenge(html, title)
+                and proxy_mode == "auto"
+                and proxy_pool is not None
+                and active_pool is not proxy_pool
+            ):
+                logger.info("%s -> challenge persisted, retrying solver through proxy", url)
+                try:
+                    proxy_html = await proxy_pool.render_with_solver(
+                        url,
+                        wait_for=effective_wait_for,
+                        timeout=effective_timeout,
+                        scroll_steps=_scroll_steps_for(config, effective_scroll),
+                        network_idle_timeout=effective_idle,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Proxy solver retry failed for %s: %s", url, exc)
+                    proxy_html = None
+                if proxy_html:
+                    html = proxy_html
+                    active_egress = "proxy"
+                    method = "browser+proxy+solver"
+                    title = _extract_title(html)
+                    content, raw_content = _to_output(
+                        html,
+                        output_format,
+                        False,
+                        effective_main,
+                        config.extract.max_content_chars,
+                        config.extract.raw_content_markdown,
+                    )
         if looks_like_challenge(html, title):
             logger.warning("%s -> anti-bot challenge page detected%s", url, " (after solver retry)" if method == "browser+solver" else "")
             return {
@@ -700,10 +839,16 @@ async def extract_url(
 
     result: Dict[str, Any] = {
         "url": original_url,
+        "final_url": final_url,
         "title": title,
         "content": content,
         "raw_content": raw_content,
         "method": method,
+        "egress": active_egress,
+        "status_code": status or None,
+        "content_type": content_type or "text/html",
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "truncated": len(content) >= config.extract.max_content_chars,
     }
     if url != original_url:
         result["rewritten_url"] = url

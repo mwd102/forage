@@ -57,6 +57,8 @@ Bypass per request with the `Cache-Control: no-cache` header; the response heade
 | `min_content_chars` | `200` | If static extraction yields less text than this, Forage falls back to the browser. |
 | `raw_content_markdown` | `true` | `true`: `raw_content` mirrors the clean markdown (Firecrawl-style contract; what Hermes' `web_extract_tool` reads first). `false`: `raw_content` keeps the raw HTML. |
 | `prefer_markdown` | `true` | Negotiate `Accept: text/markdown` on the static fetch. When the server implements markdown negotiation (e.g. via `.htaccess` / `Vary: Accept`) and serves `text/markdown`, Forage uses the body directly as markdown (`method: "markdown"`), skipping trafilatura conversion. Servers without negotiation ignore the Accept and return HTML, so the normal hybrid flow continues. |
+| `allow_private_networks` | `false` | Allow extraction from loopback, private, link-local and other non-public addresses. Keep this disabled for agent-facing deployments. |
+| `max_download_bytes` | `25000000` | Maximum response or document size accepted before extraction. |
 | `domain_overrides` | `{}` | Per-pattern extraction overrides. The YAML key is a pattern (www-insensitive, case-insensitive): `x.com` matches the host or any subdomain; `.x.com` is the same with an explicit leading dot; `amazon.*` is a wildcard on a host label (fnmatch) that matches the host and any subdomain suffix; `reddit.com/r/` requires an exact host plus a path prefix. Supported keys per override: `force_render` (bool), `full_text` (bool), `engine` (str: `trafilatura` or `readability`), `wait_for` (str), `url_rewrite` (str, format `host[/path]`), `scroll` (bool), `timeout` (int 1-120), `network_idle_timeout` (int 0-60), `challenge_timeout` (int 0-120). Request-level `force_render`/`wait_for`/`timeout`/`engine` are absolute and override the domain override. |
 
 Example: serve Reddit threads/profiles from the classic UI (comments are server-side there) and keep the Amazon buybox (price arrives via JS; trafilatura drops it as non-main):
@@ -111,6 +113,17 @@ otherwise                                                 → static result
 | `solve_cloudflare` | `false` | `scrapling` engine only. `false` (default) uses Forage's own title-poll in `page_action`, which resolves non-interactive challenges with no fixed cost. `true` uses Scrapling's built-in solver, which handles interactive challenges but waits ~5s for networkidle on every page before detecting. |
 | `fallback_solver` | `true` | On any anti-bot failure (challenge detected, any engine), retry the page with the scrapling built-in solver as a last resort. The ~5s/page solver cost is paid only when a challenge is actually detected, turning would-be failures into successes. |
 
+## `proxy`
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Enable a second browser pool using the proxy credentials from environment variables. |
+| `mode` | `fallback` | `fallback` tries direct egress first and uses the proxy only after browser failure or a persistent challenge. `always` sends browser work through the proxy first. |
+
+Each `/extract` request can set `proxy_mode` to `never`, `auto` or `always`.
+`auto` follows the configured mode, `never` disables proxy use for the request,
+and `always` requires a configured proxy.
+
 ## `auth`
 
 | Key | Default | Description |
@@ -124,6 +137,9 @@ Keys come from the `FORAGE_API_KEYS` env var (comma-separated) and are compared 
 | Variable | Where | Purpose |
 |---|---|---|
 | `FORAGE_API_KEYS` | service `.env` | Comma-separated Bearer API keys (used when `auth.enabled: true`). |
+| `FORAGE_PROXY_SERVER` | service `.env` | HTTP(S) proxy endpoint used when `proxy.enabled: true`. |
+| `FORAGE_PROXY_USERNAME` | service `.env` | Optional proxy username. |
+| `FORAGE_PROXY_PASSWORD` | service `.env` | Optional proxy password. |
 | `FORAGE_CONFIG` | service `.env` | Config file path inside the container (default `/etc/forage/config.yaml`). |
 | `TZ` | service `.env` | Container timezone. |
 | `FORAGE_URL` | Hermes `.env` | Base URL the Hermes plugin calls (e.g. `http://localhost:3672`). |

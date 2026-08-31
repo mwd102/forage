@@ -29,6 +29,7 @@ Single Python service (FastAPI + uvicorn), one container. Modules in `app/`:
 | `browser.py` | In-process Chromium pool (playwright/patchright) OR single Scrapling session; semaphore, cleanup, page_action |
 | `documents.py` | PDF/docx/xlsx/pptx/rtf extraction from raw bytes (never through the browser) |
 | `auth.py` | Bearer API keys (env `FORAGE_API_KEYS`), constant-time comparison |
+| `url_safety.py` | Public HTTP(S) destination validation for agent-supplied URLs |
 
 API: `GET /health`, `POST /search`, `POST /extract`, `POST /admin/cache/purge`.
 
@@ -92,7 +93,7 @@ API: `GET /health`, `POST /search`, `POST /extract`, `POST /admin/cache/purge`.
   (not the envelope): `{url, title, content, raw_content, method}`.
 - A URL that could not be extracted returns `{url, error}`.
 - `method` is one of `static`, `browser`, `browser+solver`, `browser+readability`,
-  or a document method (pdf/docx/xlsx/pptx/rtf).
+  `browser+proxy`, `browser+proxy+solver`, or a document method.
 
 ## Configuration
 
