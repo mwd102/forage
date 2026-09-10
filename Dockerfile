@@ -17,6 +17,7 @@ COPY app/ app/
 
 # Factory-default config (users override via bind mount in compose)
 COPY --chmod=0444 config.example.yaml /etc/forage/config.yaml
+RUN chmod 0755 /etc/forage
 
 ENV FORAGE_CONFIG=/etc/forage/config.yaml \
     HOME=/tmp \
